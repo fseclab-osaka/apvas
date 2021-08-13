@@ -1,9 +1,9 @@
 /*
- *	BIRD -- BGP Packet Processing
+ *  BIRD -- BGP Packet Processing
  *
- *	(c) 2000 Martin Mares <mj@ucw.cz>
+ *  (c) 2000 Martin Mares <mj@ucw.cz>
  *
- *	Can be freely distributed and used under the terms of the GNU GPL.
+ *  Can be freely distributed and used under the terms of the GNU GPL.
  */
 
 #undef LOCAL_DEBUG
@@ -17,27 +17,30 @@
 #include "conf/conf.h"
 #include "lib/unaligned.h"
 #include "lib/socket.h"
-#include <sys/time.h>
-#include <stdlib.h>
 
 #include "nest/cli.h"
 
 #include "bgp.h"
 #include "aggsign.h"
 
+#include <sys/time.h>
+#include <stdlib.h>
 
-#define BGP_RR_REQUEST		0
-#define BGP_RR_BEGIN		1
-#define BGP_RR_END		2
+
+#define BGP_RR_REQUEST    0
+#define BGP_RR_BEGIN    1
+#define BGP_RR_END    2
 
 
 static struct tbf rl_rcv_update = TBF_DEFAULT_LOG_LIMITS;
 static struct tbf rl_snd_update = TBF_DEFAULT_LOG_LIMITS;
 
 struct timeval s1, t1;
+int ini_time = 0;
 int elasped_time = 0;
 int tsum = 0;
 int sumcounter = 0;
+
 
 /* Table for state -> RFC 6608 FSM error subcodes */
 static byte fsm_err_subcode[BS_MAX] = {
@@ -49,15 +52,21 @@ static byte fsm_err_subcode[BS_MAX] = {
 Key key1, key2, key3, key4, key5, key6, key7, key8;
 
 int ini_setup = 0;
-int allcounter = 0;
-int ini_time = 0;
-
+int ini_sigList = 0;
+int sigListCounter = 0;
 typedef struct sign_m{ 
     ip_addr address;
     int pxlen;
     Sign sign;
     struct sign_m *next_ptr;
 }sign_mem;
+
+sign_mem *fst_ptr;
+sign_mem *cur_ptr;
+sign_mem *seach_ptr;
+
+int allcounter = 0;
+int maxcounter = 0;
 
 
 void my_element_print(const String s, const Element e){
@@ -74,7 +83,7 @@ void my_point_print(const String s, const EC_POINT p){
     int size = point_get_str_length(p);
     String str = (String)malloc(sizeof(char) * size);
     point_get_str(str, p);
-    log("size : %d, %s: %s\n",size, s, str);
+    log("%s: %s\n",s, str);
 
     free(str);
 }
@@ -199,14 +208,13 @@ void ListClear(List *list)
     }
 }
 
-void HashForSign(Hash c, const Sign sign,const String m)
+void HashForSign(Hash c, const Sign sign, List *list)
 {
     char str[5000] = "";
 
-    // 一番左のe
+    // e
     Element e;
     element_init(e, para.prg->g3);
-    
     if(point_is_infinity(sign)) {
         element_set_one(e);
     } else {
@@ -215,46 +223,50 @@ void HashForSign(Hash c, const Sign sign,const String m)
 
     int size_e = element_get_str_length(e);
     String str_e = (String)malloc(sizeof(char) * size_e);
-    element_get_str(str_e, e); //eの文字列化
+    element_get_str(str_e, e);
     //sprintf(str, "%s %s", str, str_e);
-    bsprintf(str, "%s", str_e);
+    sprintf(str, "%s", str_e);
     free(str_e);
 
     element_clear(e); 
 
     //ここ来る前に先にlistに自分入れてる
-    //pk
-    int size_pk = point_get_str_length(key1.pk);
-    String str_pk = (String)malloc(sizeof(char) * size_pk);
-    point_get_str(str_pk, key1.pk);
-    bsprintf(str, "%s %s", str, str_pk);
-    free(str_pk);
+    for(int i = ListLength(list) - 1; i >= 0 ; i--) {
+        //pk
+        int size_pk = point_get_str_length(list[i].pk);
+        String str_pk = (String)malloc(sizeof(char) * size_pk);
+        point_get_str(str_pk, list[i].pk);
+        sprintf(str, "%s %s", str, str_pk);
+        free(str_pk);
 
-    //m
-    bsprintf(str, "%s %s", str, m);
+        //m
+        sprintf(str, "%s %s", str, list[i].m);
+    }
+    //printf("str: %s\n\n", str);
     point_map_to_point(c, str, strlen(str), hash_size);
 }
 
-//SeqAggSign(sign, &key1, "as1");
-int SeqAggSign(Sign sign, const Key *key, const String m)
+//SeqAggSign(sign, list, &key1, "as1");
+int SeqAggSign(Sign sign, List *list, const Key *key, const String m)
 {
-    point_init(sign, para.prg->g1);
-    point_set_infinity(sign);
-    
-    //ListAdd(list, key->pk, m);
+    if(ListLength(list) == 0) {
+        point_init(sign, para.prg->g1);
+        point_set_infinity(sign);
+    }
+    ListAdd(list, key->pk, m);
 
     EC_POINT c;
     point_init(c, para.prg->g1);
-    HashForSign(c, sign, m);
+    HashForSign(c, sign, list);
 
     mpz_t tmp;
     mpz_init(tmp);
-    set_mpz_from_element(tmp, key->sk); //tmp=sk
+    set_mpz_from_element(tmp, key->sk);
 
     EC_POINT tmp_sign;
     point_init(tmp_sign, para.prg->g1);
-    point_mul(tmp_sign, tmp, c); //tmp_sign=sk×c
-    point_add(sign, sign, tmp_sign); //sign=sign+tmp_sign
+    point_mul(tmp_sign, tmp, c);
+    point_add(sign, sign, tmp_sign);
 
     point_clear(tmp_sign);
     mpz_clear(tmp);
@@ -266,24 +278,6 @@ int SeqAggSign(Sign sign, const Key *key, const String m)
 
 
     return 0;
-}
-
-// ********** Algorithm 4 AggSign **********//
-
-void AggSign(Sign sign1, List *list1, Sign sign2, List *list2)
-{
-    point_add(sign1, sign1, sign2);
-    point_clear(sign2);
-
-    int length1 = ListLength(list1);
-    int length2 = ListLength(list2);
-
-    for(int i = 0; i < length2; i++) {
-        point_set(list1[length1 + i].pk, list2[i].pk);
-        strcpy(list1[length1 + i].m, list2[i].m);
-    }
-    //my_point_print("AggSign", sign1);
-    printf("\n");
 }
 
 
@@ -351,8 +345,8 @@ int Verify(const Sign sign, List *list)
    
     pairing_map(e2, sign, para.g2, para.prg);
     
-    my_element_print("e1", e1);
-    my_element_print("e2", e2);
+    //my_element_print("e1", e1);
+    //my_element_print("e2", e2);
 
     int cmp = element_cmp(e1, e2);
     element_clear(e2);
@@ -363,262 +357,9 @@ int Verify(const Sign sign, List *list)
     return !cmp;
 }
 
-// ********** Algorithm 6 PointGen **********//
-void PointGen(List *list1, TList *list2, Element E){
-    
-    int length1 = ListLength(list1);
-    int length2 = sizeof(list2)/4;
-    printf("length2 : %d\n", length2);
 
-   
-    EC_POINT c;
-    point_init(c, para.prg->g1);
-    point_set_infinity(c);
-
-    Element e;
-
-    String prefix1;
-    int k;
-    int n;
-    int skip = 0;
-    for(int i = 1; i <= length1; i++) {//Ciを作る
-        if (strchr(list1[i-1].m, '/') != NULL){
-          skip = 0;
-          printf("reset NLRI\n");
-          prefix1 = strrchr(list1[i-1].m, ' ')+1;
-          printf("%s\n", prefix1);
-          printf("%d\n", length2);
-          for (n = 0; n < length2; n++){
-            printf("%s\n", list2[n].prefix);
-            if (strstr(list2[n].prefix, prefix1) != NULL){
-                   skip = 1;
-                   break;
-                }    
-          }
-          if (skip){
-            continue;
-          }
-          printf("掛け算する%s\n", prefix1);
-          k = i-1; 
-          element_init(e, para.prg->g3);
-          element_set_one(e);
-        }else if (skip){
-          continue;
-        }
-        //さっき使った検証式を先頭に
-        char str[5000] = "";
-        // e
-        int size_e = element_get_str_length(e);
-        String str_e = (String)malloc(sizeof(char) * size_e);
-        element_get_str(str_e, e);
-        //sprintf(str, "%s %s", str, str_e);
-        sprintf(str, "%s", str_e);
-        free(str_e);
-
-        
-        for(int j = i - 1; j >= k; j--) {//i-1までの平文の連結（というかiまで一気に入れてる）
-            //pk
-            int size_pk = point_get_str_length(list1[j].pk);
-            String str_pk = (String)malloc(sizeof(char) * size_pk);
-            point_get_str(str_pk, list1[j].pk);
-            sprintf(str, "%s %s", str, str_pk);
-            free(str_pk);
-
-            //m
-            sprintf(str, "%s %s", str, list1[j].m);
-        }
-        printf("str : %s\n\n", str);
-        point_map_to_point(c, str, strlen(str), hash_size);//Ci=H(str)
-
-        Element e_tmp;//右辺の掛け算
-        element_init(e_tmp, para.prg->g3);
-        pairing_map(e_tmp, c, list1[i - 1].pk, para.prg);
-        element_mul(e, e, e_tmp);
-        element_mul(E, E, e_tmp);
-        element_clear(e_tmp);        
-    }
-    element_clear(e);
-    point_clear(c);
-}
-
-// ********** Algorithm 7 PointVer **********//
-int PointVer(const Sign sign, List *list1, TList *list2, Element E){
-    
-    int length1 = ListLength(list1);
-    int length2 = sizeof(list2)/4;
-    printf("length2 : %d\n", length2);
-
-    Element e1;
-    element_init(e1, para.prg->g3);
-    element_set_one(e1);
-
-    EC_POINT c;
-    point_init(c, para.prg->g1);
-    point_set_infinity(c);
-
-    Element e;
-
-    String prefix1;
-    int k;
-    int n;
-    int flag;
-    int skip;
-    for(int i = 1; i <= length1; i++) {//Ciを作る
-
-        if (strchr(list1[i-1].m, '/') != NULL){
-          prefix1 = strrchr(list1[i-1].m, ' ')+1;
-          flag = 1;
-          for (n = 0; n < length2; n++){
-            printf("%s:::%s\n", list2[n].prefix, prefix1);
-            if (strstr(list2[n].prefix, prefix1) != NULL){
-                printf("掛け算する%s\n", prefix1);
-                k = i-1; 
-                element_init(e, para.prg->g3);
-                element_set_one(e);
-                skip = 0;
-                flag = 0;
-                break;
-            }    
-          }
-          if (flag){
-            printf("flagggggg\n");
-            skip = 1;
-          }
-        }
-
-        if(skip){
-            printf("continue\n");
-            continue;
-        }
-        //さっき使った検証式を先頭に
-        char str[5000] = "";
-        // e
-        int size_e = element_get_str_length(e);
-        String str_e = (String)malloc(sizeof(char) * size_e);
-        element_get_str(str_e, e);
-        //sprintf(str, "%s %s", str, str_e);
-        sprintf(str, "%s", str_e);
-        free(str_e);
-
-        
-        for(int j = i - 1; j >= k; j--) {//i-1までの平文の連結（というかiまで一気に入れてる）
-            //pk
-            int size_pk = point_get_str_length(list1[j].pk);
-            String str_pk = (String)malloc(sizeof(char) * size_pk);
-            point_get_str(str_pk, list1[j].pk);
-            sprintf(str, "%s %s", str, str_pk);
-            free(str_pk);
-
-            //m
-            sprintf(str, "%s %s", str, list1[j].m);
-        }
-        printf("str : %s\n\n", str);
-        point_map_to_point(c, str, strlen(str), hash_size);//Ci=H(str)
-
-        Element e_tmp;//右辺の掛け算
-        element_init(e_tmp, para.prg->g3);
-        pairing_map(e_tmp, c, list1[i - 1].pk, para.prg);
-        element_mul(e, e, e_tmp);
-        element_mul(e1, e1, e_tmp);
-
-        element_clear(e_tmp);        
-    }
-
-    Element e2;//左辺
-    element_init(e2, para.prg->g3);
-    pairing_map(e2, sign, para.g2, para.prg);
-
-    //Element invE;//左辺
-    //element_init(invE, para.prg->g3);
-    //element_inv(invE, E);
-    //element_mul(e2, e2, invE);
-
-    element_mul(e1, e1, E);
-
-    my_element_print("e1", e1);
-    my_element_print("e2", e2);
-
-    int cmp = element_cmp(e1, e2);
-    element_clear(e2);
-    element_clear(e1);
-    element_clear(e);
-    point_clear(c);
-
-    return !cmp;
-
-}
-
-void best_route(const Sign sign, List *list1, TList *list2){
-    Element E;
-    element_init(E, para.prg->g3);
-    element_set_one(E);
-        printf("%lu\n", sizeof(E));
-
-
-    printf("start PointGen~~~~~~~~~~~~~~~~~~~~~\n");
-    PointGen(list1, list2, E); 
-    printf("+++++++++++++++++++++++\n");
-    my_element_print("E", E);
-    printf("+++++++++++++++++++++++\n");
-    printf("start PointVal~~~~~~~~~~~~~~~~~~~~~\n");
-    printf("%d\n", PointVer(sign, list1, list2, E));
-
-}
-
-// ********** Algorithm 8 RemSign **********//
-
-void RemSign(Sign sign1, List *list1, Sign sign2, List *list2)
-{
-    //sign2はwithdrawnのupdateメッセージで来たやつ
-    point_sub(sign1, sign1, sign2);
-    point_clear(sign2);
-
-    int length1 = ListLength(list1);
-    int length2 = ListLength(list2);
-    List tmp_list1[list_size];
-    ListInit(tmp_list1);
-    List tmp_list2[list_size];
-    ListInit(tmp_list2);
-
-    String prefix = strrchr(list2[0].m, ' ')+1;
-    
-    int i = 0;
-    int k = 0;
-    for(i = 0; i < length1; i++) {
-        if (strstr(list1[i].m, prefix) != NULL){
-            
-            for (int j = i+length2; j < length1; j++){
-                tmp_list1[k] = list1[i+length2+k];
-                k++;
-            }
-            break;
-        }
-    }
-
-    int l = 0;
-    for (l = 0; l < i; l++){
-        tmp_list2[l] = list1[l];
-    }
-    
-    int p = 0;
-    for (l = i; l < i+k; l++){
-        tmp_list2[l] = tmp_list1[p++];
-    }    
-    
-    for(i = 0; i < length1- length2; i++) {
-        printf("i>>>>>%d\n", i);
-        point_set(list1[i].pk, tmp_list2[i].pk);
-        strcpy(list1[i].m, tmp_list2[i].m);
-    }
-    for(i = length1 - length2; i < length1; i++) {
-        printf("i>>>>>%d\n", i);
-        point_init(list1[i].pk, para.prg->g2);
-        memset(list1[i].m, 0x00, str_size);
-    }
-
-    my_point_print("RemSign", sign1);
-    printf("\n");
-}
+// ********** Algorithm 9 Tracing **********//
+//Para para;
 
 void initial_setup(){
     Setup(&para);
@@ -655,6 +396,7 @@ void initial_setup(){
     element_set_str(key8.sk, "1a646bbe712c4fc1cc1b4cff722149af05263c6cf76f51670028a0b58621f7aa");
     KeyGen(&key8);
 }  
+
 
 /*
  * MRT Dump format is not semantically specified.
@@ -704,7 +446,7 @@ static void
 mrt_dump_bgp_packet(struct bgp_conn *conn, byte *pkt, unsigned len)
 {
   //log("--packet--%s",__func__);
-  byte *buf = alloca(128+len);	/* 128 is enough for MRT headers */
+  byte *buf = alloca(128+len);  /* 128 is enough for MRT headers */
   byte *bp = buf + MRTDUMP_HDR_LENGTH;
   int as4 = conn->bgp->as4_session;
 
@@ -712,7 +454,7 @@ mrt_dump_bgp_packet(struct bgp_conn *conn, byte *pkt, unsigned len)
   memcpy(bp, pkt, len);
   bp += len;
   mrt_dump_message(&conn->bgp->p, BGP4MP, as4 ? BGP4MP_MESSAGE_AS4 : BGP4MP_MESSAGE,
-		   buf, bp-buf);
+       buf, bp-buf);
 }
 
 static inline u16
@@ -755,12 +497,12 @@ static byte *
 bgp_put_cap_ipv6(struct bgp_proto *p UNUSED, byte *buf)
 {
   //log("--packet--%s",__func__);
-  *buf++ = 1;		/* Capability 1: Multiprotocol extensions */
-  *buf++ = 4;		/* Capability data length */
-  *buf++ = 0;		/* We support AF IPv6 */
+  *buf++ = 1;   /* Capability 1: Multiprotocol extensions */
+  *buf++ = 4;   /* Capability data length */
+  *buf++ = 0;   /* We support AF IPv6 */
   *buf++ = BGP_AF_IPV6;
-  *buf++ = 0;		/* RFU */
-  *buf++ = 1;		/* and SAFI 1 */
+  *buf++ = 0;   /* RFU */
+  *buf++ = 1;   /* and SAFI 1 */
   return buf;
 }
 
@@ -770,12 +512,12 @@ static byte *
 bgp_put_cap_ipv4(struct bgp_proto *p UNUSED, byte *buf)
 {
   //log("--packet--%s",__func__);
-  *buf++ = 1;		/* Capability 1: Multiprotocol extensions */
-  *buf++ = 4;		/* Capability data length */
-  *buf++ = 0;		/* We support AF IPv4 */
+  *buf++ = 1;   /* Capability 1: Multiprotocol extensions */
+  *buf++ = 4;   /* Capability data length */
+  *buf++ = 0;   /* We support AF IPv4 */
   *buf++ = BGP_AF_IPV4;
-  *buf++ = 0;		/* RFU */
-  *buf++ = 1;		/* and SAFI 1 */
+  *buf++ = 0;   /* RFU */
+  *buf++ = 1;   /* and SAFI 1 */
   return buf;
 }
 #endif
@@ -784,8 +526,8 @@ static byte *
 bgp_put_cap_rr(struct bgp_proto *p UNUSED, byte *buf)
 {
   //log("--packet--%s",__func__);
-  *buf++ = 2;		/* Capability 2: Support for route refresh */
-  *buf++ = 0;		/* Capability data length */
+  *buf++ = 2;   /* Capability 2: Support for route refresh */
+  *buf++ = 0;   /* Capability data length */
   return buf;
 }
 
@@ -793,8 +535,8 @@ static byte *
 bgp_put_cap_ext_msg(struct bgp_proto *p UNUSED, byte *buf)
 {
   //log("--packet--%s",__func__);
-  *buf++ = 6;		/* Capability 6: Support for extended messages */
-  *buf++ = 0;		/* Capability data length */
+  *buf++ = 6;   /* Capability 6: Support for extended messages */
+  *buf++ = 0;   /* Capability data length */
   return buf;
 }
 
@@ -802,17 +544,17 @@ static byte *
 bgp_put_cap_gr1(struct bgp_proto *p, byte *buf)
 {
   //log("--packet--%s",__func__);
-  *buf++ = 64;		/* Capability 64: Support for graceful restart */
-  *buf++ = 6;		/* Capability data length */
+  *buf++ = 64;    /* Capability 64: Support for graceful restart */
+  *buf++ = 6;   /* Capability data length */
 
   put_u16(buf, p->cf->gr_time);
   if (p->p.gr_recovery)
     buf[0] |= BGP_GRF_RESTART;
   buf += 2;
 
-  *buf++ = 0;		/* Appropriate AF */
+  *buf++ = 0;   /* Appropriate AF */
   *buf++ = BGP_AF;
-  *buf++ = 1;		/* and SAFI 1 */
+  *buf++ = 1;   /* and SAFI 1 */
   *buf++ = p->p.gr_recovery ? BGP_GRF_FORWARDING : 0;
 
   return buf;
@@ -822,8 +564,8 @@ static byte *
 bgp_put_cap_gr2(struct bgp_proto *p, byte *buf)
 {
   //log("--packet--%s",__func__);
-  *buf++ = 64;		/* Capability 64: Support for graceful restart */
-  *buf++ = 2;		/* Capability data length */
+  *buf++ = 64;    /* Capability 64: Support for graceful restart */
+  *buf++ = 2;   /* Capability data length */
   put_u16(buf, 0);
   return buf + 2;
 }
@@ -832,8 +574,8 @@ static byte *
 bgp_put_cap_as4(struct bgp_proto *p, byte *buf)
 {
   //log("--packet--%s",__func__);
-  *buf++ = 65;		/* Capability 65: Support for 4-octet AS number */
-  *buf++ = 4;		/* Capability data length */
+  *buf++ = 65;    /* Capability 65: Support for 4-octet AS number */
+  *buf++ = 4;   /* Capability data length */
   put_u32(buf, p->local_as);
   return buf + 4;
 }
@@ -842,12 +584,12 @@ static byte *
 bgp_put_cap_add_path(struct bgp_proto *p, byte *buf)
 {
   //log("--packet--%s",__func__);
-  *buf++ = 69;		/* Capability 69: Support for ADD-PATH */
-  *buf++ = 4;		/* Capability data length */
+  *buf++ = 69;    /* Capability 69: Support for ADD-PATH */
+  *buf++ = 4;   /* Capability data length */
 
-  *buf++ = 0;		/* Appropriate AF */
+  *buf++ = 0;   /* Appropriate AF */
   *buf++ = BGP_AF;
-  *buf++ = 1;		/* SAFI 1 */
+  *buf++ = 1;   /* SAFI 1 */
 
   *buf++ = p->cf->add_path;
 
@@ -858,8 +600,8 @@ static byte *
 bgp_put_cap_err(struct bgp_proto *p UNUSED, byte *buf)
 {
   //log("--packet--%s",__func__);
-  *buf++ = 70;		/* Capability 70: Support for enhanced route refresh */
-  *buf++ = 0;		/* Capability data length */
+  *buf++ = 70;    /* Capability 70: Support for enhanced route refresh */
+  *buf++ = 0;   /* Capability data length */
   return buf;
 }
 
@@ -873,7 +615,7 @@ bgp_create_open(struct bgp_conn *conn, byte *buf)
   int cap_len;
 
   BGP_TRACE(D_PACKETS, "Sending OPEN(ver=%d,as=%d,hold=%d,id=%08x)",
-	    BGP_VERSION, p->local_as, p->cf->hold_time, p->local_id);
+      BGP_VERSION, p->local_as, p->cf->hold_time, p->local_id);
   buf[0] = BGP_VERSION;
   put_u16(buf+1, (p->local_as < 0xFFFF) ? p->local_as : AS_TRANS);
   put_u16(buf+3, p->cf->hold_time);
@@ -921,108 +663,97 @@ bgp_create_open(struct bgp_conn *conn, byte *buf)
   cap_len = cap - buf - 12;
   if (cap_len > 0)
     {
-      buf[9]  = cap_len + 2;	/* Optional params len */
-      buf[10] = 2;		/* Option: Capability list */
-      buf[11] = cap_len;	/* Option length */
+      buf[9]  = cap_len + 2;  /* Optional params len */
+      buf[10] = 2;    /* Option: Capability list */
+      buf[11] = cap_len;  /* Option length */
       return cap;
     }
   else
     {
-      buf[9] = 0;		/* No optional parameters */
+      buf[9] = 0;   /* No optional parameters */
       return buf + 10;
     }
 }
 
-static uint  //r_sizeを返却
+static uint
 bgp_encode_prefixes(struct bgp_proto *p, byte *w, struct bgp_bucket *buck, uint remains)
 {
-  //log("--packet--%s, %d",__func__, remains);
+  //log("--packet--%s",__func__);
   byte *start = w;
   ip_addr a;
   int bytes;
-  //log("sizeof(ip_addr): %lu", sizeof(ip_addr));//4
-  //remains = 200;
 
-    memcpy(w, "ski1-ski1-ski1-ski1", 20);
-    w += 20;
+  memcpy(w, "ski1-ski1-ski1-ski1ski2-ski2-ski2-ski2ski3-ski3-ski3-ski3", 60);
+  w += 60;
 
-    while (!EMPTY_LIST(buck->prefixes) && (remains >= (5+sizeof(ip_addr)+80))){ //ip_arrdのサイズは4
-      //log("remains: %d", remains);
+  sigListCounter = 0;
+  while (!EMPTY_LIST(buck->prefixes) && (remains >= (5+sizeof(ip_addr)+120))){
       struct bgp_prefix *px = SKIP_BACK(struct bgp_prefix, bucket_node, HEAD(buck->prefixes));
-      //log("\tDequeued route %I/%d", px->n.prefix, px->n.pxlen);//ここのキューがくそ仕様
+      //log("\tDequeued route %I/%d", px->n.prefix, px->n.pxlen);
 
       if (p->add_path_tx){
-        //log("p->add_path_tx");
-   	    put_u32(w, px->path_id);
-	      w += 4;
-	      remains -= 4;
-	    }
+        put_u32(w, px->path_id);
+        w += 4;
+        remains -= 4;
+      }
 
-        if (allcounter == 0){
-            gettimeofday(&s1, NULL);
-        }
-        
-        allcounter++;
-        if (allcounter%1000==0){
-            gettimeofday(&t1, NULL);
-            //log("timeEnd: %d", t1.tv_sec);
-            elasped_time = t1.tv_sec - s1.tv_sec;
-            tsum = tsum + elasped_time;
-            sumcounter++;
-            log("count: %d, time: %d, ave: %d", allcounter, elasped_time, tsum/sumcounter); 
-            gettimeofday(&s1, NULL);
-            //log("timeStart: %d", s1.tv_sec);
-        }
+  
+     List list1[list_size];
+      ListInit(list1);
 
-      char m[5000] = "";
-      bsprintf(m, "ski1-ski1-ski1-ski1 65001 %I/%d", px->n.prefix, px->n.pxlen);
-      //log("m: %s", m);
+      char m1[str_size] = "";
+      bsprintf(m1, "ski1-ski1-ski1-ski1 65001 %I/%d", px->n.prefix, px->n.pxlen);
+      //log("count: %d, m1: %s", sigListCounter, m1);
+      ListAdd(list1, key1.pk, m1); 
 
-    
+      char m2[str_size] = "";
+      bsprintf(m2, "ski2-ski2-ski2-ski2 65001 65002");
+      //log("count: %d, m2: %s", sigListCounter, m1);
+      ListAdd(list1, key2.pk, m2); 
+
+      char m3[str_size] = "";
+      bsprintf(m3, "ski3-ski3-ski3-ski3 65001 65002 65003");
+      //log("m3: %s", m3);
+
       Sign sign;
 
-      SeqAggSign(sign, &key1, m);  
-
-    
-
-      //log("size of sign : %lu", sizeof(sign));//64
-      //my_point_print("sign", sign);
-      //point_print(sign);
-      //log("size of sign after: %lu", sizeof(sign));//64
+      point_init(sign, para.prg->g1);
+      
+      seach_ptr = fst_ptr;
+      while(1){
+        if ((seach_ptr->pxlen == px->n.pxlen) && (seach_ptr->address == px->n.prefix)){
+          point_set(sign, seach_ptr->sign);
+          break;
+        }
+        seach_ptr = seach_ptr->next_ptr;
+      }
+      
+      
+      SeqAggSign(sign, list1, &key3, m3);
       
       *w++ = px->n.pxlen; //43番目
       bytes = (px->n.pxlen + 7) / 8; //4
       a = px->n.prefix;
       ipa_hton(a);
-      memcpy(w, &a, bytes); //44, 45, 46, 47番目
+      memcpy(w, &a, bytes);
       w += bytes;
-      
-      
+
       u8 s_bin[100];
       size_t s_bin_len = -1;
       point_to_oct(s_bin, &s_bin_len, sign);
       //log("%d, s_bin : %I",s_bin_len, a);
-
-      
-      //octとpointの変換確認用
-      //Sign sign1;
-      //point_init(sign1, para.prg->g1);
-      //point_set_infinity(sign1);
-      //point_from_oct(sign1, s_bin, s_bin_len);
-      //my_point_print("sign1", sign1);
+      //my_point_print("sig", sign);
 
       memcpy(w, s_bin, s_bin_len);
-      w += s_bin_len;
+      w += s_bin_len;  
 
-      //remains = remains - bytes - s_bin_len + 1;
-      remains = remains - 70;
+      remains = remains - 70;    
+      //remains -= bytes + 1;
       rem_node(&px->bucket_node);
       bgp_free_prefix(p, px);
       //log("remains: %d, w: %d---------------------", remains, w);
-      //point_clear(sign1);
-      point_clear(sign);
-
       // fib_delete(&p->prefix_fib, px);
+      point_clear(sign);
     }
   return w - start;
 }
@@ -1034,77 +765,78 @@ bgp_flush_prefixes(struct bgp_proto *p, struct bgp_bucket *buck)
   while (!EMPTY_LIST(buck->prefixes))
     {
       struct bgp_prefix *px = SKIP_BACK(struct bgp_prefix, bucket_node, HEAD(buck->prefixes));
-      //log(L_ERR "%s: - route %I/%d skipped", p->p.name, px->n.prefix, px->n.pxlen);
+    //  log(L_ERR "%s: - route %I/%d skipped", p->p.name, px->n.prefix, px->n.pxlen);
       rem_node(&px->bucket_node);
       bgp_free_prefix(p, px);
       // fib_delete(&p->prefix_fib, px);
     }
 }
 
-#ifndef IPV6		/* IPv4 version */
+#ifndef IPV6    /* IPv4 version */
 
 static byte *
-bgp_create_update(struct bgp_conn *conn, byte *buf){
+bgp_create_update(struct bgp_conn *conn, byte *buf)
+{
   //log("--packet--%s",__func__);
   struct bgp_proto *p = conn->bgp;
   struct bgp_bucket *buck;
-  int remains = bgp_max_packet_length(p) - BGP_HEADER_LENGTH - 4; //4096 - 19 -4 = 4073
+  int remains = bgp_max_packet_length(p) - BGP_HEADER_LENGTH - 4;
   byte *w;
   int wd_size = 0;
   int r_size = 0;
   int a_size = 0;
 
   w = buf+2;
-  if ((buck = p->withdraw_bucket) && !EMPTY_LIST(buck->prefixes)){
+  if ((buck = p->withdraw_bucket) && !EMPTY_LIST(buck->prefixes))
+    {
       DBG("Withdrawn routes:\n");
       wd_size = bgp_encode_prefixes(p, w, buck, remains);
       w += wd_size;
       remains -= wd_size;
+    }
+  put_u16(buf, wd_size);
+
+  if (remains >= 3072)
+    {
+      while ((buck = (struct bgp_bucket *) HEAD(p->bucket_queue))->send_node.next)
+  {
+    if (EMPTY_LIST(buck->prefixes))
+      {
+        DBG("Deleting empty bucket %p\n", buck);
+        rem_node(&buck->send_node);
+        bgp_free_bucket(p, buck);
+        continue;
+      }
+
+    DBG("Processing bucket %p\n", buck);
+    a_size = bgp_encode_attrs(p, w+2, buck->eattrs, 2048);
+
+    if (a_size < 0)
+      {
+      //  log(L_ERR "%s: Attribute list too long, skipping corresponding routes", p->p.name);
+        bgp_flush_prefixes(p, buck);
+        rem_node(&buck->send_node);
+        bgp_free_bucket(p, buck);
+        continue;
+      }
+
+    put_u16(w, a_size);
+    w += a_size + 2;
+    r_size = bgp_encode_prefixes(p, w, buck, remains - a_size);
+    w += r_size;
+    break;
   }
-  put_u16(buf, wd_size); //withdrawnのところ pkt[19-21]
-  //log("buf: %u, wd_size: %d",*buf, wd_size);
-
-  if (remains >= 3072){
-      while ((buck = (struct bgp_bucket *) HEAD(p->bucket_queue))->send_node.next){//キューから取り出すここの繋ぎ直しは必要
-	      if (EMPTY_LIST(buck->prefixes)){
-	        DBG("Deleting empty bucket %p\n", buck);
-	        rem_node(&buck->send_node);
-	        bgp_free_bucket(p, buck);
-	        continue;
-	      }
-        DBG("Processing bucket %p\n", buck);
-	      a_size = bgp_encode_attrs(p, w+2, buck->eattrs, 2048);
-        //a_size = bgp_encode_attrs(p, w+2, buck->eattrs, 300);
-       
-	      if (a_size < 0){
-	        //log("%s: Attribute list too long, skipping corresponding routes", p->p.name);
-	        bgp_flush_prefixes(p, buck);
-	        rem_node(&buck->send_node);
-	        bgp_free_bucket(p, buck);
-	        continue;
-	      }
-
-	      put_u16(w, a_size);  //attribute長のところ[22]
-	      w += a_size + 2; //encode_attrs内で書き込み[23-42]
-	      //log("w: %d, a_size: %d",w, a_size);//encode_prefix内で書き込み（長さという概念は無い）
-        //log("remains - a_size : %d", remains - a_size);
-        r_size = bgp_encode_prefixes(p, w, buck, remains - a_size); //prefixのところ（NLRI列挙）
-	      w += r_size;
-        //log("w: %d, r_size: %d",w, r_size);//encode_prefix内で書き込み（長さという概念は無い）
-
-	      break;
-	    }
-  }
-  if (!a_size)				/* Attributes not already encoded */{
-      //log("Attributes not already encoded");
+    }
+  if (!a_size)        /* Attributes not already encoded */
+    {
       put_u16(w, 0);
       w += 2;
-  }
-  if (wd_size || r_size){
+    }
+  if (wd_size || r_size)
+    {
       BGP_TRACE_RL(&rl_snd_update, D_PACKETS, "Sending UPDATE");
-      //log("bgp_create_update return w: %u", *w);
       return w;
-  }
+    }
   else
     return NULL;
 }
@@ -1120,7 +852,7 @@ bgp_create_end_mark(struct bgp_conn *conn, byte *buf)
   return buf+4;
 }
 
-#else		/* IPv6 version */
+#else   /* IPv6 version */
 
 static inline int
 same_iface(struct bgp_proto *p, ip_addr *ip)
@@ -1163,120 +895,120 @@ bgp_create_update(struct bgp_conn *conn, byte *buf)
   if (remains >= 3072)
     {
       while ((buck = (struct bgp_bucket *) HEAD(p->bucket_queue))->send_node.next)
-	{
-	  if (EMPTY_LIST(buck->prefixes))
-	    {
-	      DBG("Deleting empty bucket %p\n", buck);
-	      rem_node(&buck->send_node);
-	      bgp_free_bucket(p, buck);
-	      continue;
-	    }
+  {
+    if (EMPTY_LIST(buck->prefixes))
+      {
+        DBG("Deleting empty bucket %p\n", buck);
+        rem_node(&buck->send_node);
+        bgp_free_bucket(p, buck);
+        continue;
+      }
 
-	  DBG("Processing bucket %p\n", buck);
-	  rem_stored = remains;
-	  w_stored = w;
+    DBG("Processing bucket %p\n", buck);
+    rem_stored = remains;
+    w_stored = w;
 
-	  size = bgp_encode_attrs(p, w, buck->eattrs, 2048);
-	  if (size < 0)
-	    {
-	      log(L_ERR "%s: Attribute list too long, skipping corresponding routes", p->p.name);
-	      bgp_flush_prefixes(p, buck);
-	      rem_node(&buck->send_node);
-	      bgp_free_bucket(p, buck);
-	      continue;
-	    }
-	  w += size;
-	  remains -= size;
+    size = bgp_encode_attrs(p, w, buck->eattrs, 2048);
+    if (size < 0)
+      {
+    //    log(L_ERR "%s: Attribute list too long, skipping corresponding routes", p->p.name);
+        bgp_flush_prefixes(p, buck);
+        rem_node(&buck->send_node);
+        bgp_free_bucket(p, buck);
+        continue;
+      }
+    w += size;
+    remains -= size;
 
-	  /* We have two addresses here in NEXT_HOP eattr. Really.
-	     Unless NEXT_HOP was modified by filter */
-	  nh = ea_find(buck->eattrs, EA_CODE(EAP_BGP, BA_NEXT_HOP));
-	  ASSERT(nh);
-	  second = (nh->u.ptr->length == NEXT_HOP_LENGTH);
-	  ipp = (ip_addr *) nh->u.ptr->data;
-	  ip = ipp[0];
-	  ip_ll = IPA_NONE;
+    /* We have two addresses here in NEXT_HOP eattr. Really.
+       Unless NEXT_HOP was modified by filter */
+    nh = ea_find(buck->eattrs, EA_CODE(EAP_BGP, BA_NEXT_HOP));
+    ASSERT(nh);
+    second = (nh->u.ptr->length == NEXT_HOP_LENGTH);
+    ipp = (ip_addr *) nh->u.ptr->data;
+    ip = ipp[0];
+    ip_ll = IPA_NONE;
 
-	  if (ipa_equal(ip, p->source_addr))
-	    ip_ll = p->local_link;
-	  else
-	    {
-	      /* If we send a route with 'third party' next hop destinated 
-	       * in the same interface, we should also send a link local 
-	       * next hop address. We use the received one (stored in the 
-	       * other part of BA_NEXT_HOP eattr). If we didn't received
-	       * it (for example it is a static route), we can't use
-	       * 'third party' next hop and we have to use local IP address
-	       * as next hop. Sending original next hop address without
-	       * link local address seems to be a natural way to solve that
-	       * problem, but it is contrary to RFC 2545 and Quagga does not
-	       * accept such routes.
-	       *
-	       * There are two cases, either we have global IP, or
-	       * IPA_NONE if the neighbor is link-local. For IPA_NONE,
-	       * we suppose it is on the same iface, see bgp_update_attrs().
-	       */
+    if (ipa_equal(ip, p->source_addr))
+      ip_ll = p->local_link;
+    else
+      {
+        /* If we send a route with 'third party' next hop destinated 
+         * in the same interface, we should also send a link local 
+         * next hop address. We use the received one (stored in the 
+         * other part of BA_NEXT_HOP eattr). If we didn't received
+         * it (for example it is a static route), we can't use
+         * 'third party' next hop and we have to use local IP address
+         * as next hop. Sending original next hop address without
+         * link local address seems to be a natural way to solve that
+         * problem, but it is contrary to RFC 2545 and Quagga does not
+         * accept such routes.
+         *
+         * There are two cases, either we have global IP, or
+         * IPA_NONE if the neighbor is link-local. For IPA_NONE,
+         * we suppose it is on the same iface, see bgp_update_attrs().
+         */
 
-	      if (ipa_zero(ip) || same_iface(p, &ip))
-		{
-		  if (second && ipa_nonzero(ipp[1]))
-		    ip_ll = ipp[1];
-		  else
-		    {
-		      switch (p->cf->missing_lladdr)
-			{
-			case MLL_SELF:
-			  ip = p->source_addr;
-			  ip_ll = p->local_link;
-			  break;
-			case MLL_DROP:
-			  //log(L_ERR "%s: Missing link-local next hop address, skipping corresponding routes", p->p.name);
-			  w = w_stored;
-			  remains = rem_stored;
-			  bgp_flush_prefixes(p, buck);
-			  rem_node(&buck->send_node);
-			  bgp_free_bucket(p, buck);
-			  continue;
-			case MLL_IGNORE:
-			  break;
-			}
-		    }
-		}
-	    }
+        if (ipa_zero(ip) || same_iface(p, &ip))
+    {
+      if (second && ipa_nonzero(ipp[1]))
+        ip_ll = ipp[1];
+      else
+        {
+          switch (p->cf->missing_lladdr)
+      {
+      case MLL_SELF:
+        ip = p->source_addr;
+        ip_ll = p->local_link;
+        break;
+      case MLL_DROP:
+      //  log(L_ERR "%s: Missing link-local next hop address, skipping corresponding routes", p->p.name);
+        w = w_stored;
+        remains = rem_stored;
+        bgp_flush_prefixes(p, buck);
+        rem_node(&buck->send_node);
+        bgp_free_bucket(p, buck);
+        continue;
+      case MLL_IGNORE:
+        break;
+      }
+        }
+    }
+      }
 
-	  tstart = tmp = bgp_attach_attr_wa(&ea, bgp_linpool, BA_MP_REACH_NLRI, remains-8);
-	  *tmp++ = 0;
-	  *tmp++ = BGP_AF_IPV6;
-	  *tmp++ = 1;
+    tstart = tmp = bgp_attach_attr_wa(&ea, bgp_linpool, BA_MP_REACH_NLRI, remains-8);
+    *tmp++ = 0;
+    *tmp++ = BGP_AF_IPV6;
+    *tmp++ = 1;
 
-	  if (ipa_is_link_local(ip))
-	    ip = IPA_NONE;
+    if (ipa_is_link_local(ip))
+      ip = IPA_NONE;
 
-	  if (ipa_nonzero(ip_ll))
-	    {
-	      *tmp++ = 32;
-	      ipa_hton(ip);
-	      memcpy(tmp, &ip, 16);
-	      ipa_hton(ip_ll);
-	      memcpy(tmp+16, &ip_ll, 16);
-	      tmp += 32;
-	    }
-	  else
-	    {
-	      *tmp++ = 16;
-	      ipa_hton(ip);
-	      memcpy(tmp, &ip, 16);
-	      tmp += 16;
-	    }
+    if (ipa_nonzero(ip_ll))
+      {
+        *tmp++ = 32;
+        ipa_hton(ip);
+        memcpy(tmp, &ip, 16);
+        ipa_hton(ip_ll);
+        memcpy(tmp+16, &ip_ll, 16);
+        tmp += 32;
+      }
+    else
+      {
+        *tmp++ = 16;
+        ipa_hton(ip);
+        memcpy(tmp, &ip, 16);
+        tmp += 16;
+      }
 
-	  *tmp++ = 0;			/* No SNPA information */
-	  tmp += bgp_encode_prefixes(p, tmp, buck, remains - (8+3+32+1));
-	  ea->attrs[0].u.ptr->length = tmp - tstart;
-	  size = bgp_encode_attrs(p, w, ea, remains);
-	  ASSERT(size >= 0);
-	  w += size;
-	  break;
-	}
+    *tmp++ = 0;     /* No SNPA information */
+    tmp += bgp_encode_prefixes(p, tmp, buck, remains - (8+3+32+1));
+    ea->attrs[0].u.ptr->length = tmp - tstart;
+    size = bgp_encode_attrs(p, w, ea, remains);
+    ASSERT(size >= 0);
+    w += size;
+    break;
+  }
     }
 
   size = w - (buf+4);
@@ -1299,16 +1031,16 @@ bgp_create_end_mark(struct bgp_conn *conn, byte *buf)
   BGP_TRACE(D_PACKETS, "Sending END-OF-RIB");
 
   put_u16(buf+0, 0);
-  put_u16(buf+2, 6);	/* length 4-9 */
+  put_u16(buf+2, 6);  /* length 4-9 */
   buf += 4;
 
   /* Empty MP_UNREACH_NLRI atribute */
   *buf++ = BAF_OPTIONAL;
   *buf++ = BA_MP_UNREACH_NLRI;
-  *buf++ = 3;		/* Length 7-9 */
-  *buf++ = 0;		/* AFI */
+  *buf++ = 3;   /* Length 7-9 */
+  *buf++ = 0;   /* AFI */
   *buf++ = BGP_AF_IPV6;
-  *buf++ = 1;		/* SAFI */
+  *buf++ = 1;   /* SAFI */
   return buf;
 }
 
@@ -1325,7 +1057,7 @@ bgp_create_route_refresh(struct bgp_conn *conn, byte *buf)
   *buf++ = 0;
   *buf++ = BGP_AF;
   *buf++ = BGP_RR_REQUEST;
-  *buf++ = 1;		/* SAFI */
+  *buf++ = 1;   /* SAFI */
   return buf;
 }
 
@@ -1340,7 +1072,7 @@ bgp_create_begin_refresh(struct bgp_conn *conn, byte *buf)
   *buf++ = 0;
   *buf++ = BGP_AF;
   *buf++ = BGP_RR_BEGIN;
-  *buf++ = 1;		/* SAFI */
+  *buf++ = 1;   /* SAFI */
   return buf;
 }
 
@@ -1355,16 +1087,16 @@ bgp_create_end_refresh(struct bgp_conn *conn, byte *buf)
   *buf++ = 0;
   *buf++ = BGP_AF;
   *buf++ = BGP_RR_END;
-  *buf++ = 1;		/* SAFI */
+  *buf++ = 1;   /* SAFI */
   return buf;
 }
 
-//bgp_create_header(buf, end - buf, type);
+
 static void
 bgp_create_header(byte *buf, uint len, uint type)
 {
   //log("--packet--%s",__func__);
-  memset(buf, 0xff, 16);		/* Marker */
+  memset(buf, 0xff, 16);    /* Marker */
   put_u16(buf+16, len);
   buf[18] = type;
 }
@@ -1389,63 +1121,83 @@ bgp_fire_tx(struct bgp_conn *conn)
   byte *buf, *pkt, *end;
   int type;
 
-  if (!sk){
+  if (!sk)
+    {
       conn->packets_to_send = 0;
       return 0;
-  }
+    }
   buf = sk->tbuf;
   pkt = buf + BGP_HEADER_LENGTH;
 
-  if (s & (1 << PKT_SCHEDULE_CLOSE)){
+  if (s & (1 << PKT_SCHEDULE_CLOSE))
+    {
       /* We can finally close connection and enter idle state */
       bgp_conn_enter_idle_state(conn);
       return 0;
-  }
-  if (s & (1 << PKT_NOTIFICATION)){
+    }
+  if (s & (1 << PKT_NOTIFICATION))
+    {
       s = 1 << PKT_SCHEDULE_CLOSE;
       type = PKT_NOTIFICATION;
       end = bgp_create_notification(conn, pkt);
-  }else if (s & (1 << PKT_KEEPALIVE)){
+    }
+  else if (s & (1 << PKT_KEEPALIVE))
+    {
       s &= ~(1 << PKT_KEEPALIVE);
       type = PKT_KEEPALIVE;
-      end = pkt;			/* Keepalives carry no data */
+      end = pkt;      /* Keepalives carry no data */
       BGP_TRACE(D_PACKETS, "Sending KEEPALIVE");
       bgp_start_timer(conn->keepalive_timer, conn->keepalive_time);
-  }else if (s & (1 << PKT_OPEN)){
+    }
+  else if (s & (1 << PKT_OPEN))
+    {
       s &= ~(1 << PKT_OPEN);
       type = PKT_OPEN;
       end = bgp_create_open(conn, pkt);
-  }else if (s & (1 << PKT_ROUTE_REFRESH)){
+    }
+  else if (s & (1 << PKT_ROUTE_REFRESH))
+    {
       s &= ~(1 << PKT_ROUTE_REFRESH);
       type = PKT_ROUTE_REFRESH;
       end = bgp_create_route_refresh(conn, pkt);
-  }else if (s & (1 << PKT_BEGIN_REFRESH)){
+    }
+  else if (s & (1 << PKT_BEGIN_REFRESH))
+    {
       s &= ~(1 << PKT_BEGIN_REFRESH);
-      type = PKT_ROUTE_REFRESH;	/* BoRR is a subtype of RR */
+      type = PKT_ROUTE_REFRESH; /* BoRR is a subtype of RR */
       end = bgp_create_begin_refresh(conn, pkt);
-  }else if (s & (1 << PKT_UPDATE)){
-      if (!ini_setup){
-        initial_setup();
-        ini_setup = 1;
-      }
+    }
+  else if (s & (1 << PKT_UPDATE))
+    {
       type = PKT_UPDATE;
       end = bgp_create_update(conn, pkt);
-      if (!end){/* No update to send, perhaps we need to send End-of-RIB or EoRR */
-        conn->packets_to_send = 0;
 
-	      if (p->feed_state == BFS_LOADED){
-	        type = PKT_UPDATE;
-	        end = bgp_create_end_mark(conn, pkt);
-	      }else if (p->feed_state == BFS_REFRESHED){
-	        type = PKT_ROUTE_REFRESH;
-	        end = bgp_create_end_refresh(conn, pkt);
-	      }else /* Really nothing to send */
-	        return 0; //0になったら送信終了
+      if (!end)
+        {
+    /* No update to send, perhaps we need to send End-of-RIB or EoRR */
 
-	      p->feed_state = BFS_NONE;
-	    }
-  }else
-    return 0; //0になったら送信終了
+    conn->packets_to_send = 0;
+
+    if (p->feed_state == BFS_LOADED)
+    {
+      type = PKT_UPDATE;
+      end = bgp_create_end_mark(conn, pkt);
+    }
+
+    else if (p->feed_state == BFS_REFRESHED)
+    {
+      type = PKT_ROUTE_REFRESH;
+      end = bgp_create_end_refresh(conn, pkt);
+    }
+
+    else /* Really nothing to send */
+      return 0;
+
+    p->feed_state = BFS_NONE;
+  }
+    }
+  else
+    return 0;
 
   conn->packets_to_send = s;
   bgp_create_header(buf, end - buf, type);
@@ -1503,66 +1255,66 @@ bgp_parse_capabilities(struct bgp_conn *conn, byte *opt, int len)
   while (len > 0)
     {
       if (len < 2 || len < 2 + opt[1])
-	goto err;
+  goto err;
 
       cl = opt[1];
 
       switch (opt[0])
-	{
-	case 2:	/* Route refresh capability, RFC 2918 */
-	  if (cl != 0)
-	    goto err;
-	  conn->peer_refresh_support = 1;
-	  break;
+  {
+  case 2: /* Route refresh capability, RFC 2918 */
+    if (cl != 0)
+      goto err;
+    conn->peer_refresh_support = 1;
+    break;
 
-	case 6: /* Extended message length capability, draft */
-	  if (cl != 0)
-	    goto err;
-	  conn->peer_ext_messages_support = 1;
-	  break;
+  case 6: /* Extended message length capability, draft */
+    if (cl != 0)
+      goto err;
+    conn->peer_ext_messages_support = 1;
+    break;
 
-	case 64: /* Graceful restart capability, RFC 4724 */
-	  if (cl % 4 != 2)
-	    goto err;
-	  conn->peer_gr_aware = 1;
-	  conn->peer_gr_able = 0;
-	  conn->peer_gr_time = get_u16(opt + 2) & 0x0fff;
-	  conn->peer_gr_flags = opt[2] & 0xf0;
-	  conn->peer_gr_aflags = 0;
-	  for (i = 2; i < cl; i += 4)
-	    if (opt[2+i+0] == 0 && opt[2+i+1] == BGP_AF && opt[2+i+2] == 1) /* Match AFI/SAFI */
-	      {
-		conn->peer_gr_able = 1;
-		conn->peer_gr_aflags = opt[2+i+3];
-	      }
-	  break;
+  case 64: /* Graceful restart capability, RFC 4724 */
+    if (cl % 4 != 2)
+      goto err;
+    conn->peer_gr_aware = 1;
+    conn->peer_gr_able = 0;
+    conn->peer_gr_time = get_u16(opt + 2) & 0x0fff;
+    conn->peer_gr_flags = opt[2] & 0xf0;
+    conn->peer_gr_aflags = 0;
+    for (i = 2; i < cl; i += 4)
+      if (opt[2+i+0] == 0 && opt[2+i+1] == BGP_AF && opt[2+i+2] == 1) /* Match AFI/SAFI */
+        {
+    conn->peer_gr_able = 1;
+    conn->peer_gr_aflags = opt[2+i+3];
+        }
+    break;
 
-	case 65: /* AS4 capability, RFC 4893 */
-	  if (cl != 4)
-	    goto err;
-	  conn->peer_as4_support = 1;
-	  if (conn->bgp->cf->enable_as4)
-	    conn->advertised_as = get_u32(opt + 2);
-	  break;
+  case 65: /* AS4 capability, RFC 4893 */
+    if (cl != 4)
+      goto err;
+    conn->peer_as4_support = 1;
+    if (conn->bgp->cf->enable_as4)
+      conn->advertised_as = get_u32(opt + 2);
+    break;
 
-	case 69: /* ADD-PATH capability, draft */
-	  if (cl % 4)
-	    goto err;
-	  for (i = 0; i < cl; i += 4)
-	    if (opt[2+i+0] == 0 && opt[2+i+1] == BGP_AF && opt[2+i+2] == 1) /* Match AFI/SAFI */
-	      conn->peer_add_path = opt[2+i+3];
-	  if (conn->peer_add_path > ADD_PATH_FULL)
-	    goto err;
-	  break;
+  case 69: /* ADD-PATH capability, draft */
+    if (cl % 4)
+      goto err;
+    for (i = 0; i < cl; i += 4)
+      if (opt[2+i+0] == 0 && opt[2+i+1] == BGP_AF && opt[2+i+2] == 1) /* Match AFI/SAFI */
+        conn->peer_add_path = opt[2+i+3];
+    if (conn->peer_add_path > ADD_PATH_FULL)
+      goto err;
+    break;
 
-	case 70: /* Enhanced route refresh capability, RFC 7313 */
-	  if (cl != 0)
-	    goto err;
-	  conn->peer_enhanced_refresh_support = 1;
-	  break;
+  case 70: /* Enhanced route refresh capability, RFC 7313 */
+    if (cl != 0)
+      goto err;
+    conn->peer_enhanced_refresh_support = 1;
+    break;
 
-	  /* We can safely ignore all other capabilities */
-	}
+    /* We can safely ignore all other capabilities */
+  }
       len -= 2 + cl;
       opt += 2 + cl;
     }
@@ -1583,37 +1335,37 @@ bgp_parse_options(struct bgp_conn *conn, byte *opt, int len)
   while (len > 0)
     {
       if (len < 2 || len < 2 + opt[1])
-	{ bgp_error(conn, 2, 0, NULL, 0); return 0; }
+  { bgp_error(conn, 2, 0, NULL, 0); return 0; }
 #ifdef LOCAL_DEBUG
       {
-	int i;
-	DBG("\tOption %02x:", opt[0]);
-	for(i=0; i<opt[1]; i++)
-	  DBG(" %02x", opt[2+i]);
-	DBG("\n");
+  int i;
+  DBG("\tOption %02x:", opt[0]);
+  for(i=0; i<opt[1]; i++)
+    DBG(" %02x", opt[2+i]);
+  DBG("\n");
       }
 #endif
 
       ol = opt[1];
       switch (opt[0])
-	{
-	case 2:
-	  if (conn->start_state == BSS_CONNECT_NOCAP)
-	    BGP_TRACE(D_PACKETS, "Ignoring received capabilities");
-	  else
-	    bgp_parse_capabilities(conn, opt + 2, ol);
-	  break;
+  {
+  case 2:
+    if (conn->start_state == BSS_CONNECT_NOCAP)
+      BGP_TRACE(D_PACKETS, "Ignoring received capabilities");
+    else
+      bgp_parse_capabilities(conn, opt + 2, ol);
+    break;
 
-	default:
-	  /*
-	   *  BGP specs don't tell us to send which option
-	   *  we didn't recognize, but it's common practice
-	   *  to do so. Also, capability negotiation with
-	   *  Cisco routers doesn't work without that.
-	   */
-	  bgp_error(conn, 2, 4, opt, ol);
-	  return 0;
-	}
+  default:
+    /*
+     *  BGP specs don't tell us to send which option
+     *  we didn't recognize, but it's common practice
+     *  to do so. Also, capability negotiation with
+     *  Cisco routers doesn't work without that.
+     */
+    bgp_error(conn, 2, 4, opt, ol);
+    return 0;
+  }
       len -= 2 + ol;
       opt += 2 + ol;
     }
@@ -1660,12 +1412,12 @@ bgp_rx_open(struct bgp_conn *conn, byte *pkt, int len)
   if (conn->advertised_as != p->remote_as)
     {
       if (conn->peer_as4_support)
-	{
-	  u32 val = htonl(conn->advertised_as);
-	  bgp_error(conn, 2, 2, (byte *) &val, 4);
-	}
+  {
+    u32 val = htonl(conn->advertised_as);
+    bgp_error(conn, 2, 2, (byte *) &val, 4);
+  }
       else
-	bgp_error(conn, 2, 2, pkt+20, 2);
+  bgp_error(conn, 2, 2, pkt+20, 2);
 
       return;
     }
@@ -1701,13 +1453,13 @@ bgp_rx_open(struct bgp_conn *conn, byte *pkt, int len)
        * connection, otherwise we keep the old one.
        */
       if (((p->local_id < id) || ((p->local_id == id) && (p->local_as < p->remote_as)))
-	  == (conn == &p->incoming_conn))
+    == (conn == &p->incoming_conn))
         {
-	  /* Should close the other connection */
-	  BGP_TRACE(D_EVENTS, "Connection collision, giving up the other connection");
-	  bgp_error(other, 6, 7, NULL, 0);
-	  break;
-	}
+    /* Should close the other connection */
+    BGP_TRACE(D_EVENTS, "Connection collision, giving up the other connection");
+    bgp_error(other, 6, 7, NULL, 0);
+    break;
+  }
       /* Fall thru */
     case BS_ESTABLISHED:
       /* Should close this connection */
@@ -1756,33 +1508,33 @@ bgp_rx_end_mark(struct bgp_proto *p)
 }
 
 
-#define DECODE_PREFIX(pp, ll) do {		\
-  if (p->add_path_rx)				\
-  {						\
-    if (ll < 5) { err=1; goto done; }		\
-    path_id = get_u32(pp);			\
-    pp += 4;					\
-    ll -= 4;					\
-  }						\
-  int b = *pp++;				\
-  int q;					\
-  ll--;						\
+#define DECODE_PREFIX(pp, ll) do {    \
+  if (p->add_path_rx)       \
+  {           \
+    if (ll < 5) { err=1; goto done; }   \
+    path_id = get_u32(pp);      \
+    pp += 4;          \
+    ll -= 4;          \
+  }           \
+  int b = *pp++;        \
+  int q;          \
+  ll--;           \
   if (b > BITS_PER_IP_ADDRESS) { err=10; goto done; } \
-  q = (b+7) / 8;				\
-  if (ll < q) { err=1; goto done; }		\
-  memcpy(&prefix, pp, q);			\
-  pp += q;					\
-  ll -= q;					\
-  ipa_ntoh(prefix);				\
-  prefix = ipa_and(prefix, ipa_mkmask(b));	\
-  pxlen = b;					\
+  q = (b+7) / 8;        \
+  if (ll < q) { err=1; goto done; }   \
+  memcpy(&prefix, pp, q);     \
+  pp += q;          \
+  ll -= q;          \
+  ipa_ntoh(prefix);       \
+  prefix = ipa_and(prefix, ipa_mkmask(b));  \
+  pxlen = b;          \
 } while (0)
 
 
 static inline void
 bgp_rte_update(struct bgp_proto *p, ip_addr prefix, int pxlen,
-	       u32 path_id, u32 *last_id, struct rte_src **src,
-	       rta *a0, rta **a)
+         u32 path_id, u32 *last_id, struct rte_src **src,
+         rta *a0, rta **a)
 {
   //log("--packet--%s",__func__);
   if (path_id != *last_id)
@@ -1791,10 +1543,10 @@ bgp_rte_update(struct bgp_proto *p, ip_addr prefix, int pxlen,
       *last_id = path_id;
 
       if (*a)
-	{
-	  rta_free(*a);
-	  *a = NULL;
-	}
+  {
+    rta_free(*a);
+    *a = NULL;
+  }
     }
 
   /* Prepare cached route attributes */
@@ -1818,9 +1570,9 @@ bgp_rte_update(struct bgp_proto *p, ip_addr prefix, int pxlen,
 
 static inline void
 bgp_rte_withdraw(struct bgp_proto *p, ip_addr prefix, int pxlen,
-		 u32 path_id, u32 *last_id, struct rte_src **src)
+     u32 path_id, u32 *last_id, struct rte_src **src)
 {
-  //log("--packet--%s",__func__);
+  log("--packet--%s",__func__);
   if (path_id != *last_id)
     {
       *src = rt_find_source(&p->p, path_id);
@@ -1853,16 +1605,16 @@ bgp_set_next_hop(struct bgp_proto *p, rta *a)
       neighbor *ng = NULL;
 
       if (ipa_nonzero(*nexthop))
-	ng = neigh_find(&p->p, nexthop, 0);
-      else if (second)	/* GW_DIRECT -> single_hop -> p->neigh != NULL */
-	ng = neigh_find2(&p->p, nexthop + 1, p->neigh->iface, 0);
+  ng = neigh_find(&p->p, nexthop, 0);
+      else if (second)  /* GW_DIRECT -> single_hop -> p->neigh != NULL */
+  ng = neigh_find2(&p->p, nexthop + 1, p->neigh->iface, 0);
 
       /* Fallback */
       if (!ng)
-	ng = p->neigh;
+  ng = p->neigh;
 
       if (ng->scope == SCOPE_HOST)
-	return 0;
+  return 0;
 
       a->dest = RTD_ROUTER;
       a->gw = ng->addr;
@@ -1873,7 +1625,7 @@ bgp_set_next_hop(struct bgp_proto *p, rta *a)
   else /* GW_RECURSIVE */
     {
       if (ipa_zero(*nexthop))
-	  return 0;
+    return 0;
 
       rta_set_recursive_next_hop(p->p.table, a, p->igp_table, nexthop, nexthop + second);
     }
@@ -1881,13 +1633,13 @@ bgp_set_next_hop(struct bgp_proto *p, rta *a)
   return 1;
 }
 
-#ifndef IPV6		/* IPv4 version */
+#ifndef IPV6    /* IPv4 version */
 
 static void
 bgp_do_rx_update(struct bgp_conn *conn,
-		 byte *withdrawn, int withdrawn_len,
-		 byte *nlri, int nlri_len,
-		 byte *attrs, int attr_len)
+     byte *withdrawn, int withdrawn_len,
+     byte *nlri, int nlri_len,
+     byte *attrs, int attr_len)
 {
   //log("--packet--%s",__func__);
   struct bgp_proto *p = conn->bgp;
@@ -1897,6 +1649,13 @@ bgp_do_rx_update(struct bgp_conn *conn,
   int pxlen, err = 0;
   u32 path_id = 0;
   u32 last_id = 0;
+
+  if (!ini_setup){
+    initial_setup();
+    ini_setup = 1;
+    fst_ptr = (sign_mem*)malloc(sizeof(sign_mem));
+    fst_ptr->next_ptr = NULL;    
+  }
 
   /* Check for End-of-RIB marker */
   if (!withdrawn_len && !attr_len && !nlri_len)
@@ -1914,12 +1673,12 @@ bgp_do_rx_update(struct bgp_conn *conn,
       bgp_rte_withdraw(p, prefix, pxlen, path_id, &last_id, &src);
     }
 
-  if (!attr_len && !nlri_len)		/* shortcut */
+  if (!attr_len && !nlri_len)       /* shortcut */
     return;
 
   a0 = bgp_decode_attrs(conn, attrs, attr_len, bgp_linpool, nlri_len);
 
-  if (conn->state != BS_ESTABLISHED)	/* fatal error during decoding */
+  if (conn->state != BS_ESTABLISHED)    /* fatal error during decoding */
     return;
 
   if (a0 && nlri_len && !bgp_set_next_hop(p, a0))
@@ -1928,17 +1687,141 @@ bgp_do_rx_update(struct bgp_conn *conn,
   last_id = 0;
   src = p->p.main_source;
 
+  char sign_str[170];
+  int i = 0;
+  char perleft = '[';
+  char comma =  ',';
+  char perright = ']';
+  List list1[list_size];
+  //int sigListCounter = 0;
+
+  nlri += 40;
+  nlri_len -= 40;
+    
+
   while (nlri_len)
-    {
+    { 
+      //log("(s)nlri: %d", *(nlri));
       DECODE_PREFIX(nlri, nlri_len);
-      DBG("Add %I/%d\n", prefix, pxlen);
-      nlri += 64;
-      nlri_len -= 64;
+   
+      sign_str[0]='\0';
+     
+      bsprintf(sign_str, "%c", perleft);
+     
+      bsprintf(sign_str, "%s%x", sign_str, (*(nlri+1)));
+     
+      for (i = 2; i <= 32; ++i){
+        //log("%d", *(nlri+i));
+        if (((int)(*(nlri+i)))<16){
+          bsprintf(sign_str, "%s0%x", sign_str, (*(nlri+i)));
+        }else{
+          bsprintf(sign_str, "%s%x", sign_str, (*(nlri+i)));
+        }        
+        //log("sign_str: %s", sign_str);
+      }
+
+      bsprintf(sign_str, "%s%c", sign_str, comma);
+      //log("sign_str: %s", sign_str);
+
+      bsprintf(sign_str, "%s%x", sign_str, (*(nlri+33)));
+      //log("sign_str: %s", sign_str);
+
+      for (i = 34; i <= 64; ++i){
+        //log("%d", *(nlri+i));
+        if (((int)(*(nlri+i)))<16){
+          bsprintf(sign_str, "%s0%x", sign_str, (*(nlri+i)));
+        }else{
+          bsprintf(sign_str, "%s%x", sign_str, (*(nlri+i)));
+        }
+        //log("sign_str: %s", sign_str);        
+      }
+      
+      bsprintf(sign_str, "%s%c", sign_str, perright);
+      //log("sign_str: %s", sign_str);
+
+      Sign sign_tmp;
+      point_init(sign_tmp, para.prg->g1);
+
+      point_set_str(sign_tmp, sign_str);
+
+      //my_point_print("sign_tmp", sign_tmp);
+
+         //検証(AS3)
+      ListInit(list1);
+      char m1[str_size] = "";
+      bsprintf(m1, "ski1-ski1-ski1-ski1 65001 %I/%d", prefix, pxlen);
+      ListAdd(list1, key1.pk, m1);
+
+      char m2[str_size] = "";
+      bsprintf(m2, "ski1-ski2-ski2-ski2 65001 65002");
+      ListAdd(list1, key2.pk, m2); 
+
+      //Verify(sign_tmp, list1);
+      //my_point_print("sign_tmp", sign_tmp);
+      Verify(sign_tmp, list1);
+      //log("VERIFY3 %d", Verify(sign_tmp, list1));
+      //署名リストに格納
+
+      sign_mem *new_sign = (sign_mem*)malloc(sizeof(sign_mem));
+      point_init(new_sign->sign, para.prg->g1);
+      point_set(new_sign->sign, sign_tmp);
+      new_sign->address = prefix;
+      new_sign->pxlen = pxlen;
+
+      point_clear(sign_tmp);
+
+
+      if (fst_ptr->next_ptr == NULL){
+        fst_ptr->next_ptr = new_sign;
+        cur_ptr = new_sign;
+      }else{
+        cur_ptr->next_ptr = new_sign;
+        cur_ptr = new_sign;
+      }
+
+       if (allcounter == 0){
+            gettimeofday(&s1, NULL);
+        }
+      allcounter++;
+      if (allcounter%1000 == 0){
+         gettimeofday(&t1, NULL);
+        //log("timeEnd: %d", t1.tv_sec);
+        elasped_time = t1.tv_sec - s1.tv_sec;
+        tsum = tsum + elasped_time;
+        sumcounter++;
+        log("count: %d, time: %d, ave: %d", allcounter, elasped_time, tsum/sumcounter); 
+        //log("countAll: %d, time: %d", allcounter, (t1.tv_sec - s1.tv_sec));
+        gettimeofday(&s1, NULL);
+        //log("timeStart: %d", s1.tv_sec);        
+      }
+
+   
+
+      //log("nlri: %d", *(nlri));//4のやつ
+      //log("nlri+1: %d", *(nlri+1));//1番目
+      //log("nlri+63: %d", *(nlri+63));//...
+      //log("nlri+64: %d", *(nlri+64));//32番目
+      //log("nlri+65: %d", *(nlri+65));//次のNLRI
+
+      //e(sign_tmp, P)を署名ボックスに格納. 署名ボックス={e, prefix/len}
+
+
+      nlri += 65;
+      nlri_len -= 65;
+      //log("**nlri: %u, nlri_len:%d", nlri, nlri_len);
       if (a0)
-	bgp_rte_update(p, prefix, pxlen, path_id, &last_id, &src, a0, &a);
+        bgp_rte_update(p, prefix, pxlen, path_id, &last_id, &src, a0, &a);
       else /* Forced withdraw as a result of soft error */
-	bgp_rte_withdraw(p, prefix, pxlen, path_id, &last_id, &src);
+        bgp_rte_withdraw(p, prefix, pxlen, path_id, &last_id, &src);
+
+      //log("***nlri: %u, nlri_len:%d", nlri, nlri_len);
     }
+    //for (int i = 0; i < 10000; ++i)
+    //{
+    //    log("sigList[%d]:", i);
+    //    my_point_print(":", sigList[i]);
+    //}
+    //ini_sigList = 0;
 
  done:
   if (a)
@@ -1948,30 +1831,31 @@ bgp_do_rx_update(struct bgp_conn *conn,
     bgp_error(conn, 3, err, NULL, 0);
 
   return;
+
 }
 
-#else			/* IPv6 version */
+#else     /* IPv6 version */
 
-#define DO_NLRI(name)				\
-  start = x = p->name##_start;			\
-  len = len0 = p->name##_len;			\
-  if (len)					\
-    {						\
-      if (len < 3) { err=9; goto done; }	\
-      af = get_u16(x);				\
-      sub = x[2];				\
-      x += 3;					\
-      len -= 3;					\
+#define DO_NLRI(name)         \
+  start = x = p->name##_start;        \
+  len = len0 = p->name##_len;       \
+  if (len)            \
+    {             \
+      if (len < 3) { err=9; goto done; }    \
+      af = get_u16(x);          \
+      sub = x[2];         \
+      x += 3;           \
+      len -= 3;           \
       DBG("\tNLRI AF=%d sub=%d len=%d\n", af, sub, len);\
-    }						\
-  else						\
-    af = 0;					\
+    }             \
+  else              \
+    af = 0;           \
   if (af == BGP_AF_IPV6)
 
 static void
 bgp_attach_next_hop(rta *a0, byte *x)
 {
-  log("--packet--%s",__func__);
+  //log("--packet--%s",__func__);
   ip_addr *nh = (ip_addr *) bgp_attach_attr_wa(&a0->eattrs, bgp_linpool, BA_NEXT_HOP, NEXT_HOP_LENGTH);
   memcpy(nh, x+1, 16);
   ipa_ntoh(nh[0]);
@@ -1989,9 +1873,9 @@ bgp_attach_next_hop(rta *a0, byte *x)
 
 static void
 bgp_do_rx_update(struct bgp_conn *conn,
-		 byte *withdrawn, int withdrawn_len,
-		 byte *nlri, int nlri_len,
-		 byte *attrs, int attr_len)
+     byte *withdrawn, int withdrawn_len,
+     byte *nlri, int nlri_len,
+     byte *attrs, int attr_len)
 {
   //log("--packet--%s",__func__);
   struct bgp_proto *p = conn->bgp;
@@ -2009,7 +1893,7 @@ bgp_do_rx_update(struct bgp_conn *conn,
   p->mp_unreach_len = 0;
   a0 = bgp_decode_attrs(conn, attrs, attr_len, bgp_linpool, 0);
 
-  if (conn->state != BS_ESTABLISHED)	/* fatal error during decoding */
+  if (conn->state != BS_ESTABLISHED)  /* fatal error during decoding */
     return;
 
   /* Check for End-of-RIB marker */
@@ -2023,42 +1907,42 @@ bgp_do_rx_update(struct bgp_conn *conn,
   DO_NLRI(mp_unreach)
     {
       while (len)
-	{
-	  DECODE_PREFIX(x, len);
-	  DBG("Withdraw %I/%d\n", prefix, pxlen);
-	  bgp_rte_withdraw(p, prefix, pxlen, path_id, &last_id, &src);
-	}
+  {
+    DECODE_PREFIX(x, len);
+    DBG("Withdraw %I/%d\n", prefix, pxlen);
+    bgp_rte_withdraw(p, prefix, pxlen, path_id, &last_id, &src);
+  }
     }
 
   DO_NLRI(mp_reach)
     {
       /* Create fake NEXT_HOP attribute */
       if (len < 1 || (*x != 16 && *x != 32) || len < *x + 2)
-	{ err = 9; goto done; }
+  { err = 9; goto done; }
 
       if (a0)
-	bgp_attach_next_hop(a0, x);
+  bgp_attach_next_hop(a0, x);
 
       /* Also ignore one reserved byte */
       len -= *x + 2;
       x += *x + 2;
 
       if (a0 && ! bgp_set_next_hop(p, a0))
-	a0 = NULL;
+  a0 = NULL;
 
       last_id = 0;
       src = p->p.main_source;
 
       while (len)
-	{
-	  DECODE_PREFIX(x, len);
-	  DBG("Add %I/%d\n", prefix, pxlen);
+  {
+    DECODE_PREFIX(x, len);
+    DBG("Add %I/%d\n", prefix, pxlen);
 
-	  if (a0)
-	    bgp_rte_update(p, prefix, pxlen, path_id, &last_id, &src, a0, &a);
-	  else /* Forced withdraw as a result of soft error */
-	    bgp_rte_withdraw(p, prefix, pxlen, path_id, &last_id, &src);
-	}
+    if (a0)
+      bgp_rte_update(p, prefix, pxlen, path_id, &last_id, &src, a0, &a);
+    else /* Forced withdraw as a result of soft error */
+      bgp_rte_withdraw(p, prefix, pxlen, path_id, &last_id, &src);
+  }
     }
 
  done:
@@ -2144,7 +2028,7 @@ static struct {
   { 3, 4, "Invalid attribute flags" },
   { 3, 5, "Invalid attribute length" },
   { 3, 6, "Invalid ORIGIN attribute" },
-  { 3, 7, "AS routing loop" },		/* Deprecated */
+  { 3, 7, "AS routing loop" },    /* Deprecated */
   { 3, 8, "Invalid NEXT_HOP attribute" },
   { 3, 9, "Optional attribute error" },
   { 3, 10, "Invalid network field" },
@@ -2184,7 +2068,7 @@ bgp_error_dsc(unsigned code, unsigned subcode)
   for (i=0; i < ARRAY_SIZE(bgp_msg_table); i++)
     if (bgp_msg_table[i].major == code && bgp_msg_table[i].minor == subcode)
       {
-	return bgp_msg_table[i].msg;
+  return bgp_msg_table[i].msg;
       }
 
   bsprintf(buff, "Unknown error %d.%d", code, subcode);
@@ -2211,19 +2095,19 @@ bgp_log_error(struct bgp_proto *p, u8 class, char *msg, unsigned code, unsigned 
       *t++ = ' ';
 
       if ((code == 2) && (subcode == 2) && ((len == 2) || (len == 4)))
-	{
-	  /* Bad peer AS - we would like to print the AS */
-	  t += bsprintf(t, "%d", (len == 2) ? get_u16(data) : get_u32(data));
-	  goto done;
-	}
+  {
+    /* Bad peer AS - we would like to print the AS */
+    t += bsprintf(t, "%d", (len == 2) ? get_u16(data) : get_u32(data));
+    goto done;
+  }
       if (len > 16)
-	len = 16;
+  len = 16;
       for (i=0; i<len; i++)
-	t += bsprintf(t, "%02x", data[i]);
+  t += bsprintf(t, "%02x", data[i]);
     }
  done:
   *t = 0;
-  //log(L_REMOTE "%s: %s: %s%s", p->p.name, msg, name, argbuf);
+  log(L_REMOTE "%s: %s: %s%s", p->p.name, msg, name, argbuf);
 }
 
 static void
@@ -2258,7 +2142,7 @@ bgp_rx_notification(struct bgp_conn *conn, byte *pkt, int len)
       /* Not possible with disabled capabilities */
     {
       /* We try connect without capabilities */
-      //log(L_WARN "%s: Capability related error received, retry with capabilities disabled", p->p.name);
+    //  log(L_WARN "%s: Capability related error received, retry with capabilities disabled", p->p.name);
       p->start_state = BSS_CONNECT_NOCAP;
       err = 0;
     }
@@ -2337,7 +2221,8 @@ bgp_rx_route_refresh(struct bgp_conn *conn, byte *pkt, int len)
     break;
 
   default:
-    //log(L_WARN "%s: Got ROUTE-REFRESH message with unknown subtype %u, ignoring",p->p.name, subtype);
+    log(L_WARN "%s: Got ROUTE-REFRESH message with unknown subtype %u, ignoring",
+  p->p.name, subtype);
     break;
   }
 }
@@ -2359,8 +2244,7 @@ bgp_rx_packet(struct bgp_conn *conn, byte *pkt, unsigned len)
   byte type = pkt[18];
 
   //for (int i = 0; i < len; ++i)
-    //log("pkt[%d]: %d", i, pkt[i]);
- 
+  //  log("pkt[%d]: %d", i, pkt[i]);
   
   DBG("BGP: Got packet %02x (%d bytes)\n", type, len);
 
@@ -2369,12 +2253,12 @@ bgp_rx_packet(struct bgp_conn *conn, byte *pkt, unsigned len)
 
   switch (type)
     {
-    case PKT_OPEN:		return bgp_rx_open(conn, pkt, len);
-    case PKT_UPDATE:		return bgp_rx_update(conn, pkt, len);
+    case PKT_OPEN:    return bgp_rx_open(conn, pkt, len);
+    case PKT_UPDATE:    return bgp_rx_update(conn, pkt, len);
     case PKT_NOTIFICATION:      return bgp_rx_notification(conn, pkt, len);
-    case PKT_KEEPALIVE:		return bgp_rx_keepalive(conn);
-    case PKT_ROUTE_REFRESH:	return bgp_rx_route_refresh(conn, pkt, len);
-    default:			bgp_error(conn, 1, 3, pkt+18, 1);
+    case PKT_KEEPALIVE:   return bgp_rx_keepalive(conn);
+    case PKT_ROUTE_REFRESH: return bgp_rx_route_refresh(conn, pkt, len);
+    default:      bgp_error(conn, 1, 3, pkt+18, 1);
     }
 }
 
@@ -2402,21 +2286,21 @@ bgp_rx(sock *sk, int size)
   while (end >= pkt_start + BGP_HEADER_LENGTH)
     {
       if ((conn->state == BS_CLOSE) || (conn->sk != sk))
-	return 0;
+  return 0;
       for(i=0; i<16; i++)
-	if (pkt_start[i] != 0xff)
-	  {
-	    bgp_error(conn, 1, 1, NULL, 0);
-	    break;
-	  }
+  if (pkt_start[i] != 0xff)
+    {
+      bgp_error(conn, 1, 1, NULL, 0);
+      break;
+    }
       len = get_u16(pkt_start+16);
       if (len < BGP_HEADER_LENGTH || len > bgp_max_packet_length(p))
-	{
-	  bgp_error(conn, 1, 2, pkt_start+16, 2);
-	  break;
-	}
+  {
+    bgp_error(conn, 1, 2, pkt_start+16, 2);
+    break;
+  }
       if (end < pkt_start + len)
-	break;
+  break;
       bgp_rx_packet(conn, pkt_start, len);
       pkt_start += len;
     }
