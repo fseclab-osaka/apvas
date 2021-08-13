@@ -13,7 +13,7 @@ Details of the protocol are described in the following paper.
   
    http://www.cipher.risk.tsukuba.ac.jp/tepla/index.html
 
-1. Replace bird-1.6.0/proto/bgp/packets.c 
+1. Replace bird-1.6.0/proto/bgp/packets.c in each AS.
 
 1. Run setup.sh
 
